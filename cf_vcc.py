@@ -1,0 +1,102 @@
+# import argparse
+# parser = argparse.ArgumentParser()
+# parser.add_argument("embedding", type = str, help = "embedding path, None for no embedding")
+# parser.add_argument("data", type = str, help = "data path")
+# args = parser.parse_args()
+
+import scanpy as sc
+from cellflow.model import CellFlow
+import requests
+import pandas as pd
+import torch
+import pickle
+from esm import pretrained
+from UniProtMapper import ProtMapper
+class ESMConverter:
+  def __init__(self, model:str):
+    self.model, self.alphabet = pretrained.load_model_and_alphabet(model)
+    self.batch_converter = self.alphabet.get_batch_converter()
+
+  def convert(self, sequences):
+    batch_labels, batch_strs, batch_tokens = self.batch_converter(sequences)
+    with torch.no_grad():
+      token_embeddings = self.model(batch_tokens, repr_layers=[33])
+      embeddings = token_embeddings['representations'][33]
+      average_embeddings = embeddings.mean(dim=1)
+    return average_embeddings
+  
+def get_protein_sequence_by_gene(gene_name):
+    mapper = ProtMapper()
+    result, failed = mapper.get(
+        ids=gene_name, from_db="Gene_Name", to_db="UniProtKB"
+    )
+    result = result[(result['Organism'] == "Homo sapiens (Human)")&(result['Reviewed'] == "reviewed")]
+    protein = result.iloc[0]["Entry"]
+    # print(protein)
+    # Define the UniProt API endpoint
+    sequence_url = f"https://www.uniprot.org/uniprot/{protein}.fasta"
+    sequence_response = requests.get(sequence_url)
+        
+    if sequence_response.status_code == 200:
+        # Extract and return the protein sequence
+        sequence = ''.join(sequence_response.text.splitlines()[1:])
+        return sequence
+    else:
+        return "NONE"
+    
+filePath = "../vcc_sample.h5ad"
+
+adata = sc.read_h5ad(filePath)
+
+adata.obs['control'] = [(lambda x: True if x == "non-targeting" else False)(x) for x in adata.obs['target_gene']]
+
+# Parameters for preparing data
+sample_rep = "X"
+control_key = "control"
+perturbation_covariates = {"gene": ("target_gene",)}
+split_covariates = ["batch"]
+perturbation_covariate_reps = {"gene": "gene_embedding"}
+sample_covariates = None
+sample_covariate_reps = None
+
+if flag:
+    embedding = pickle.load(open("subsample_gene_embedding.pkl", "rb"))
+else:
+    # If not, prepare gene embeddings
+    # Sort out target genes
+    genes = adata.obs[adata.obs['control'] == False]['target_gene'].to_list()
+    genes = list(set(genes))
+
+    embedding = pd.DataFrame(columns=["gene", "protein", "embedding"])
+    embedding["gene"] = genes
+    embedding.index = genes
+    embedding["protein"] = embedding['gene'].apply(get_protein_sequence_by_gene)
+    converter = ESMConverter("esm2_t33_650M_UR50D")
+    sequences = list(zip(embedding['gene'], embedding['protein']))
+    em = []
+    for s in sequences:
+        em.append(converter.convert([s]))
+    embedding['embedding'] = em
+    # Save embedding to pickle
+    pd.to_pickle(embedding,"subsample_gene_embedding.pkl")
+
+embedding['embedding'] = embedding['embedding'].apply(torch.flatten)
+adata.uns['gene_embedding'] = {}
+for g in embedding['gene']:
+    adata.uns['gene_embedding'][g] = embedding.loc[g]['embedding']
+
+# Split train/test data
+train_test_split = 0.8
+train = adata[:int(train_test_split*adata.n_obs), :]
+test = adata[int(train_test_split*adata.n_obs)+1:, :]
+cf = CellFlow(train)
+cf.prepare_data(
+    sample_rep = sample_rep,
+    control_key = control_key,
+    perturbation_covariates = perturbation_covariates,
+    perturbation_covariate_reps = perturbation_covariate_reps,
+    split_covariates = split_covariates,
+)
+cf.prepare_model()
+cf.prepare_validation_data(test, name = "test")
+cf.train(num_iterations=10, batch_size = 512)
