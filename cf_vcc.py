@@ -12,6 +12,7 @@ import torch
 import pickle
 from esm import pretrained
 from UniProtMapper import ProtMapper
+import random
 class ESMConverter:
   def __init__(self, model:str):
     self.model, self.alphabet = pretrained.load_model_and_alphabet(model)
@@ -44,7 +45,8 @@ def get_protein_sequence_by_gene(gene_name):
     else:
         return "NONE"
     
-filePath = "../vcc_sample.h5ad"
+print("Load dataset...")
+filePath = "./data/vcc_sample.h5ad"
 
 adata = sc.read_h5ad(filePath)
 
@@ -59,8 +61,11 @@ perturbation_covariate_reps = {"gene": "gene_embedding"}
 sample_covariates = None
 sample_covariate_reps = None
 
+flag = True
+print("Load dataset complete")
+print("Load embedding data...")
 if flag:
-    embedding = pickle.load(open("subsample_gene_embedding.pkl", "rb"))
+    embedding = pickle.load(open("./paths/subsample_gene_embedding.pkl", "rb"))
 else:
     # If not, prepare gene embeddings
     # Sort out target genes
@@ -85,18 +90,38 @@ adata.uns['gene_embedding'] = {}
 for g in embedding['gene']:
     adata.uns['gene_embedding'][g] = embedding.loc[g]['embedding']
 
+print("Load embedding complete")
+print("Split train/test data...")
 # Split train/test data
-train_test_split = 0.8
-train = adata[:int(train_test_split*adata.n_obs), :]
-test = adata[int(train_test_split*adata.n_obs)+1:, :]
+# Split train_test data
+x = adata[adata.obs['control'] == True]
+y = adata[adata.obs['control'] == False]
+fraction = 0.2
+# For runability test, sample little data
+# x_t = sc.pp.sample(x, n = 1000, copy = True)
+# y_t = sc.pp.sample(y, n = 5000, copy = True)
+x_train = x[:int(fraction*x.n_obs), :]
+y_train = y[:int(fraction*y.n_obs), :]
+x_eval = x[int(fraction*x.n_obs):, :]
+y_eval = y[int(fraction*y.n_obs):, :]
+
+train = x_train.concatenate(y_train)
+eval = x_eval.concatenate(y_eval)
+x_eval.obs['target_gene'] = random.sample(list(y_eval.obs['target_gene']), x_eval.n_obs)
+
+train.uns = adata.uns
+eval.uns = adata.uns
+print("Split complete")
+print("Initialization...")
 cf = CellFlow(train)
 cf.prepare_data(
     sample_rep = sample_rep,
     control_key = control_key,
     perturbation_covariates = perturbation_covariates,
-    perturbation_covariate_reps = perturbation_covariate_reps,
-    split_covariates = split_covariates,
+    perturbation_covariate_reps = perturbation_covariate_reps
 )
 cf.prepare_model()
-cf.prepare_validation_data(test, name = "test")
-cf.train(num_iterations=10, batch_size = 512)
+cf.prepare_validation_data(eval, name = "test")
+print("Initialization complete")
+cf.train(num_iterations=10, batch_size = 1024)
+cf.save("./models/","cf-default", overwrite=False)
