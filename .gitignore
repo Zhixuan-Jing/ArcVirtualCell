@@ -22,3 +22,4 @@ paper/*
 .DS_Store/
 __pycache__/
 subsample_gene_embedding.pkl
+paths/
